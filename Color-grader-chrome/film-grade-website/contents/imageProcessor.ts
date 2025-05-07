@@ -207,7 +207,9 @@ const CONFIG = {
   // Continuous processing enabled
   ENABLE_CONTINUOUS_PROCESSING: true,
   // Debug display for unprocessed images
-  DEBUG_UNPROCESSED: true
+  DEBUG_UNPROCESSED: true,
+  // Debug mode
+  DEBUG: true
 };
 
 // Add a more visible progress indicator in the corner of the page
@@ -256,7 +258,6 @@ interface MediaElements {
 }
 
 // Find all media assets to process (images, videos, canvas)
-// This is a minification-resistant version that will work even after bundling
 function findMediaElements(): MediaElements {
   try {
     // Increment call counter for debugging
@@ -272,9 +273,7 @@ function findMediaElements(): MediaElements {
     const largeElements: HTMLElement[] = [];
     
     // Find visible images that are large enough to be worth processing
-    // CRITICAL FIX: Only filter on data-film-grade-skip attribute, NOT data-film-grade-processed
-    // This allows us to reprocess images that may have been marked but not actually processed
-    const imageSelector = 'img:not([aria-hidden="true"]):not([role="presentation"]):not([data-film-grade-skip])';
+    const imageSelector = 'img:not([data-film-grade-skip]), picture img:not([data-film-grade-skip])';
     const images = document.querySelectorAll(imageSelector);
     
     let imageCount = 0;
@@ -291,7 +290,7 @@ function findMediaElements(): MediaElements {
         return;
       }
       
-      // Skip if too small (below MIN_IMAGE_SIZE) or SVG
+      // Skip SVG vectors but allow more image types
       if (isSVGorVector(imgEl)) {
         if (CONFIG.DEBUG_UNPROCESSED) {
           skippedImages.push({element: imgEl, reason: 'SVG'});
@@ -299,9 +298,10 @@ function findMediaElements(): MediaElements {
         return;
       }
       
+      // Drastically lower minimum size to catch more text-based images
       // Check if image is visible and large enough to be worth processing
       const rect = imgEl.getBoundingClientRect();
-      if (rect.width < CONFIG.MIN_IMAGE_SIZE || rect.height < CONFIG.MIN_IMAGE_SIZE) {
+      if (rect.width < 5 || rect.height < 5) { // Reduced from CONFIG.MIN_IMAGE_SIZE
         if (CONFIG.DEBUG_UNPROCESSED) {
           skippedImages.push({element: imgEl, reason: 'TOO_SMALL', size: `${rect.width}x${rect.height}`});
         }
@@ -317,21 +317,34 @@ function findMediaElements(): MediaElements {
       const horInView = (rect.left <= windowWidth + CONFIG.VIEWPORT_EXPANSION && rect.right >= -CONFIG.VIEWPORT_EXPANSION);
       
       if (vertInView && horInView) {
-        // Skip if this image has a data URL source (indicates already processed)
-        if (imgEl.src && imgEl.src.startsWith('data:image') && imgEl.dataset.filmGradeOriginalSrc) {
-          if (CONFIG.DEBUG_UNPROCESSED) {
-            skippedImages.push({element: imgEl, reason: 'ALREADY_PROCESSED'});
-          }
-          return;
-        }
+        // Special handling for picture > img elements (common in responsive sites like Medium)
+        const isWithinPicture = imgEl.parentElement?.tagName.toLowerCase() === 'picture';
         
-        // Check if this is a large image to process later
-        if (rect.width > CONFIG.LARGE_IMAGE_SIZE || rect.height > CONFIG.LARGE_IMAGE_SIZE) {
-          largeElements.push(imgEl);
+        // Even if an image has a data URL source, we should process it if:
+        // 1. It's within a picture element (might be a responsive image)
+        // 2. It has role="presentation" (common for lazy-loaded images on Medium)
+        // 3. It doesn't have our processed flag
+        const shouldForceProcess = isWithinPicture || 
+                                  imgEl.getAttribute('role') === 'presentation' ||
+                                  (imgEl.src.startsWith('data:') && !imgEl.dataset.filmGradeProcessed);
+        
+        if (shouldForceProcess) {
+          // For images in picture elements, we'll process them even if they look processed
+          if (rect.width > CONFIG.LARGE_IMAGE_SIZE || rect.height > CONFIG.LARGE_IMAGE_SIZE) {
+            largeElements.push(imgEl);
+          } else {
+            regularElements.push(imgEl);
+          }
+          imageCount++;
         } else {
-          regularElements.push(imgEl);
+          // Regular processing decision
+          if (rect.width > CONFIG.LARGE_IMAGE_SIZE || rect.height > CONFIG.LARGE_IMAGE_SIZE) {
+            largeElements.push(imgEl);
+          } else {
+            regularElements.push(imgEl);
+          }
+          imageCount++;
         }
-        imageCount++;
       } else {
         if (CONFIG.DEBUG_UNPROCESSED) {
           skippedImages.push({
@@ -344,9 +357,10 @@ function findMediaElements(): MediaElements {
       }
     });
     
-    // Be more selective with background images too
+    // Look for text-based content with background images like case studies and diagrams
     if (imageCount < CONFIG.MAX_IMAGES_TO_PROCESS) {
-      const bgContainers = document.querySelectorAll('div[style*="background-image"]:not([data-film-grade-skip])');
+      // Expand background image search to include more elements (div, section, article, etc.)
+      const bgContainers = document.querySelectorAll('div[style*="background-image"]:not([data-film-grade-skip]), section[style*="background-image"]:not([data-film-grade-skip]), article[style*="background-image"]:not([data-film-grade-skip]), figure[style*="background-image"]:not([data-film-grade-skip])');
       
       bgContainers.forEach((el) => {
         // Skip if already at our limit
@@ -362,11 +376,10 @@ function findMediaElements(): MediaElements {
           return;
         }
         
+        // Allow non-empty background images of any size
         if (style.backgroundImage && 
             style.backgroundImage !== 'none' && 
-            !style.backgroundImage.includes('svg') && 
-            element.offsetWidth > CONFIG.MIN_IMAGE_SIZE && 
-            element.offsetHeight > CONFIG.MIN_IMAGE_SIZE) {
+            !style.backgroundImage.includes('svg')) {
           
           // Check if in viewport like we did with images
           const rect = element.getBoundingClientRect();
@@ -387,6 +400,37 @@ function findMediaElements(): MediaElements {
           }
         }
       });
+      
+      // Add handling for text content with backgrounds/styles (like your case study)
+      const textContainers = document.querySelectorAll('.case-study, .research, article, section, [style*="border"], [style*="outline"]');
+      textContainers.forEach((el) => {
+        // Skip if already at our limit
+        if (imageCount >= CONFIG.MAX_IMAGES_TO_PROCESS) return;
+        
+        const element = el as HTMLElement;
+        
+        // Skip if already processed
+        if (element.dataset.filmGradeOriginalSrc) return;
+        
+        // Get dimensions and position
+        const rect = element.getBoundingClientRect();
+        if (rect.width < 100 || rect.height < 100) return; // Skip too small text containers
+        
+        const windowHeight = window.innerHeight || document.documentElement.clientHeight;
+        const windowWidth = window.innerWidth || document.documentElement.clientWidth;
+        
+        const vertInView = (rect.top <= windowHeight + CONFIG.VIEWPORT_EXPANSION && rect.bottom >= -CONFIG.VIEWPORT_EXPANSION);
+        const horInView = (rect.left <= windowWidth + CONFIG.VIEWPORT_EXPANSION && rect.right >= -CONFIG.VIEWPORT_EXPANSION);
+        
+        if (vertInView && horInView) {
+          if (rect.width > CONFIG.LARGE_IMAGE_SIZE || rect.height > CONFIG.LARGE_IMAGE_SIZE) {
+            largeElements.push(element);
+          } else {
+            regularElements.push(element);
+          }
+          imageCount++;
+        }
+      });
     }
     
     // Display debug info about skipped images if enabled
@@ -394,7 +438,7 @@ function findMediaElements(): MediaElements {
       debugLog(`Skipped ${skippedImages.length} images:`);
       console.table(skippedImages.map(item => ({
         reason: item.reason,
-        src: item.element instanceof HTMLImageElement ? item.element.src.substring(0, 50) : 'background',
+         src: item.element instanceof HTMLImageElement ? item.element.src.substring(0, 50) : 'background',
         size: item.size || `${item.element.clientWidth}x${item.element.clientHeight}`,
         position: item.position || ''
       })));
@@ -529,6 +573,9 @@ const applyCubeLUT = (imageData: ImageData, lut: { size: number, data: number[][
   const result = new ImageData(width, height);
   const resultData = result.data;
   
+  // Get the max index to prevent out-of-bounds access
+  const maxLutIndex = lut.data.length - 1;
+  
   for (let i = 0; i < data.length; i += 4) {
     const r = data[i] / 255;
     const g = data[i + 1] / 255;
@@ -536,29 +583,20 @@ const applyCubeLUT = (imageData: ImageData, lut: { size: number, data: number[][
     
     // Find closest LUT indices
     const size = lut.size;
-    const x = Math.floor(r * (size - 1)); // R-index
-    const y = Math.floor(g * (size - 1)); // G-index
-    const z = Math.floor(b * (size - 1)); // B-index
     
-    // Get index in the flattened LUT array
-    // Corrected for B-fastest, G-medium, R-slowest LUT data order
-    const idx = z + y * size + x * size * size; 
+    // Clamp indices to valid range to prevent out-of-bounds
+    const x = Math.min(size - 1, Math.max(0, Math.floor(r * (size - 1)))); // R-index
+    const y = Math.min(size - 1, Math.max(0, Math.floor(g * (size - 1)))); // G-index
+    const z = Math.min(size - 1, Math.max(0, Math.floor(b * (size - 1)))); // B-index
     
-    // Apply LUT transformation
-    if (idx >= 0 && idx < lut.data.length) {
-      resultData[i] = Math.round(lut.data[idx][0] * 255);
-      resultData[i + 1] = Math.round(lut.data[idx][1] * 255);
-      resultData[i + 2] = Math.round(lut.data[idx][2] * 255);
-    } else {
-      // Fallback if index is out of range
-      resultData[i] = data[i];
-      resultData[i + 1] = data[i + 1];
-      resultData[i + 2] = data[i + 2];
-      // Only warn in debug mode and very occasionally to avoid console spam
-      if (DEBUG_MODE && Math.random() < 0.001) { // Reduced from 0.01 to 0.001
-        console.warn(`Film Grade: LUT index out of bounds (${idx}/${lut.data.length-1})`);
-      }
-    }
+    // Calculate index safely, ensuring we never exceed the array bounds
+    let idx = z + y * size + x * size * size;
+    idx = Math.min(maxLutIndex, Math.max(0, idx)); // Safely clamp within bounds
+    
+    // Apply LUT transformation (no need for bounds check anymore)
+    resultData[i] = Math.round(lut.data[idx][0] * 255);
+    resultData[i + 1] = Math.round(lut.data[idx][1] * 255);
+    resultData[i + 2] = Math.round(lut.data[idx][2] * 255);
     resultData[i + 3] = data[i + 3]; // Keep original alpha
   }
   
@@ -613,28 +651,59 @@ const processImage = async (
     return;
   }
 
-  const originalSrcAttr = originalImgElement.getAttribute('src');
-  const processedSrc = originalImgElement.dataset.filmGradeOriginalSrc;
-  const cacheKey = `${originalSrcAttr}-${preset}-${enableGrain ? 1 : 0}-${enableVignette ? 1 : 0}`;
-
-  // Skip if already processed with same settings or in cache
-  if (!forceReprocess && 
-      ((processedSrc && processedSrc === originalSrcAttr) ||
-       processedUrlCache.has(cacheKey))) {
+  // Skip if already locked - it means we've already processed it
+  if (originalImgElement.dataset.filmGradeLocked === 'true' && !forceReprocess) {
+    debugLog('Skipping already locked image');
     return;
   }
 
-  // If already being processed, skip
+  // IMPORTANT: First check if this element is already being processed to prevent race conditions
   if (originalImgElement.getAttribute(PROCESSING_ATTRIBUTE) === 'true') {
+    debugLog(`Skipping already processing image: ${originalImgElement.src.substring(0, 50)}...`);
     return;
   }
 
   try {
-    // Mark as processing and show loading indicator
+    // Mark as processing BEFORE doing anything else (prevents concurrent processing attempts)
     originalImgElement.setAttribute(PROCESSING_ATTRIBUTE, 'true');
     
+    // Special handling for picture elements and presentation images
+    const isWithinPicture = originalImgElement.parentElement?.tagName.toLowerCase() === 'picture';
+    const isPresentationImage = originalImgElement.getAttribute('role') === 'presentation';
+    
+    // For Medium.com-style images, use data-film-grade-original-src if it exists but wasn't set by us
+    // This handles the case where the site already uses data URLs for initial loading
+    let originalSrc = originalImgElement.getAttribute('src');
+    
+    // If we're on a site using data URLs for initial loading (like Medium),
+    // and they've saved the original src in a data attribute, use that instead
+    if (originalSrc && originalSrc.startsWith('data:image') && originalImgElement.dataset.filmGradeOriginalSrc) {
+      // We'll use their saved original source instead of the data URL
+      originalSrc = originalImgElement.dataset.filmGradeOriginalSrc;
+      // But mark that we need to reprocess this image
+      forceReprocess = true;
+    }
+    
+    // If we don't have a valid source, we can't process
+    if (!originalSrc) {
+      originalImgElement.removeAttribute(PROCESSING_ATTRIBUTE);
+      return;
+    }
+
+    const cacheKey = `${originalSrc}-${preset}-${enableGrain ? 1 : 0}-${enableVignette ? 1 : 0}`;
+
+    // Skip if already processed with same settings or in cache
+    // Only skip if we're not forcing reprocessing
+    if (!forceReprocess && 
+        processedUrlCache.has(cacheKey) && 
+        originalImgElement.dataset.filmGradeProcessed === 'true') {
+      debugLog(`Skipping already processed image with same settings: ${originalSrc.substring(0, 50)}...`);
+      originalImgElement.removeAttribute(PROCESSING_ATTRIBUTE);
+      return;
+    }
+    
     // Load the image with crossorigin="anonymous" to avoid tainting the canvas
-    const imageToProcess = await loadImageCrossOrigin(originalSrcAttr!);
+    const imageToProcess = await loadImageCrossOrigin(originalSrc);
     
     let width = imageToProcess.naturalWidth;
     let height = imageToProcess.naturalHeight;
@@ -695,6 +764,7 @@ const processImage = async (
         processed = true;
       } catch (err) {
         // Just log to the console and continue
+        debugError('LUT processing error', err);
       }
     }
     
@@ -708,31 +778,71 @@ const processImage = async (
     }
     
     if (processed) {
-      // Use lower quality for performance
-      originalImgElement.src = canvas.toDataURL('image/jpeg', 0.85); 
-      originalImgElement.dataset.filmGradeOriginalSrc = originalSrcAttr!;
+      // Create the data URL first before modifying the element to minimize flicker
+      const dataUrl = canvas.toDataURL('image/jpeg', 0.85);
+      
+      // First lock the image to prevent the site from changing it back
+      lockImageSrc(originalImgElement);
+      
+      // If this is in a <picture> element, disable all <source> elements
+      // This must be done before setting the src to prevent flickering
+      if (originalImgElement.parentElement?.tagName.toLowerCase() === 'picture') {
+        disablePictureSourceElements(originalImgElement);
+      }
+      
+      // Store the ORIGINAL source (not the data URL that might already be there)
+      originalImgElement.dataset.filmGradeOriginalSrc = originalSrc;
+      
+      // Mark as processed by the extension to distinguish from site's data URLs BEFORE changing src
+      originalImgElement.dataset.filmGradeProcessed = 'true';
+      
       // Add to cache to prevent redundant processing
       processedUrlCache.add(cacheKey);
-      // Don't mark as processed anymore - we want to allow reprocessing
-      // originalImgElement.setAttribute('data-film-grade-processed', 'true');
+      
+      // Allow our extension to modify the src
+      originalImgElement.dataset.filmGradeAllowSet = 'true';
+      
+      // Now set the src to the processed image
+      originalImgElement.src = dataUrl;
+      
+      // Prevent further modifications
+      originalImgElement.dataset.filmGradeAllowSet = 'false';
     } else {
-      if (originalImgElement.src.startsWith('data:image') && originalImgElement.dataset.filmGradeOriginalSrc) {
+      // If we didn't apply any processing, revert to original source if we have it
+      if (originalImgElement.dataset.filmGradeOriginalSrc &&
+          originalImgElement.src !== originalImgElement.dataset.filmGradeOriginalSrc) {
+         // Allow our extension to modify the src
+         originalImgElement.dataset.filmGradeAllowSet = 'true';
          originalImgElement.src = originalImgElement.dataset.filmGradeOriginalSrc;
+         originalImgElement.dataset.filmGradeAllowSet = 'false';
+         delete originalImgElement.dataset.filmGradeProcessed;
       }
       delete originalImgElement.dataset.filmGradeOriginalSrc;
     }
   } catch (err) {
-    // Silent fail
-    if (originalImgElement.dataset.filmGradeOriginalSrc && originalImgElement.src !== originalImgElement.dataset.filmGradeOriginalSrc) {
+    // Log the error
+    debugError('Image processing error', err);
+    
+    // Try to revert to original source if available
+    if (originalImgElement.dataset.filmGradeOriginalSrc && 
+        originalImgElement.src !== originalImgElement.dataset.filmGradeOriginalSrc) {
+        // Allow our extension to modify the src
+        originalImgElement.dataset.filmGradeAllowSet = 'true';
         originalImgElement.src = originalImgElement.dataset.filmGradeOriginalSrc;
+        originalImgElement.dataset.filmGradeAllowSet = 'false';
+        delete originalImgElement.dataset.filmGradeProcessed;
     }
   } finally {
-    // Always remove processing attribute regardless of outcome
-    originalImgElement.removeAttribute(PROCESSING_ATTRIBUTE);
+    // Critical: Create a small delay before removing the processing attribute
+    // This helps prevent race conditions with multiple concurrent processing attempts
+    setTimeout(() => {
+      // Always remove processing attribute regardless of outcome
+      originalImgElement.removeAttribute(PROCESSING_ATTRIBUTE);
+    }, 50);
   }
 };
 
-// Process a background image
+// Process a background image or text element
 const processBackgroundImage = async (
   element: HTMLElement,
   preset: string,
@@ -740,16 +850,41 @@ const processBackgroundImage = async (
   enableVignette: boolean = false,
   forceReprocess: boolean = false
 ): Promise<void> => {
+  // First check if already processing to prevent race conditions
+  if (element.getAttribute(PROCESSING_ATTRIBUTE) === 'true') {
+    debugLog(`Skipping already processing background: ${element.className}`);
+    return;
+  }
+  
+  // Mark as processing BEFORE doing anything else
+  element.setAttribute(PROCESSING_ATTRIBUTE, 'true');
+  
+  // First, check if this is a text-based element rather than a background image
+  const isTextElement = !element.style.backgroundImage || element.style.backgroundImage === 'none';
+  
+  if (isTextElement) {
+    // Process text-based element with CSS filters instead of canvas
+    const result = await processTextElement(element, preset);
+    // Remove processing attribute when text processing is done
+    setTimeout(() => {
+      element.removeAttribute(PROCESSING_ATTRIBUTE);
+    }, 50);
+    return result;
+  }
+  
+  // Continue with regular background image processing
   const style = window.getComputedStyle(element);
   const bgImageStyle = style.backgroundImage;
   
   const match = bgImageStyle.match(/url\(['"]?(.*?)['"]?\)/);
   if (!match || !match[1]) {
+    element.removeAttribute(PROCESSING_ATTRIBUTE);
     return;
   }
   
   const imageUrl = match[1];
   if (!imageUrl || imageUrl === 'none' || imageUrl.trim() === '') {
+    element.removeAttribute(PROCESSING_ATTRIBUTE);
     return;
   }
 
@@ -758,20 +893,14 @@ const processBackgroundImage = async (
   
   // Skip if already processed with same settings or in cache
   if (!forceReprocess && 
-      ((processedUrl && processedUrl === imageUrl) ||
-       processedUrlCache.has(cacheKey))) {
-    return;
-  }
-
-  // If already being processed, skip
-  if (element.getAttribute(PROCESSING_ATTRIBUTE) === 'true') {
+      processedUrlCache.has(cacheKey) && 
+      element.dataset.filmGradeProcessed === 'true') {
+    debugLog(`Skipping already processed background with same settings`);
+    element.removeAttribute(PROCESSING_ATTRIBUTE);
     return;
   }
 
   try {
-    // Mark as processing and show loading indicator
-    element.setAttribute(PROCESSING_ATTRIBUTE, 'true');
-    
     const imageToProcess = await loadImageCrossOrigin(imageUrl);
 
     const canvas = document.createElement('canvas');
@@ -831,14 +960,22 @@ const processBackgroundImage = async (
     }
     
     if (processed) {
+      // Generate data URL first before changing the element
       const dataUrl = canvas.toDataURL();
-      element.style.backgroundImage = `url('${dataUrl}')`;
+      
+      // Save the original URL and mark as processed
       element.dataset.filmGradeOriginalSrc = imageUrl;
+      element.dataset.filmGradeProcessed = 'true';
+      
       // Add to cache to prevent redundant processing
       processedUrlCache.add(cacheKey);
+      
+      // Now update the background image
+      element.style.backgroundImage = `url('${dataUrl}')`;
     } else {
       if (element.style.backgroundImage.startsWith('url("data:image') && element.dataset.filmGradeOriginalSrc) {
           element.style.backgroundImage = `url('${element.dataset.filmGradeOriginalSrc}')`;
+          delete element.dataset.filmGradeProcessed;
       }
       delete element.dataset.filmGradeOriginalSrc;
     }
@@ -848,14 +985,80 @@ const processBackgroundImage = async (
     
     if (element.dataset.filmGradeOriginalSrc && element.style.backgroundImage !== `url('${element.dataset.filmGradeOriginalSrc}')`) {
         element.style.backgroundImage = `url('${element.dataset.filmGradeOriginalSrc}')`;
+        delete element.dataset.filmGradeProcessed;
     }
   } finally {
-    // Always remove processing attribute regardless of outcome
-    element.removeAttribute(PROCESSING_ATTRIBUTE);
+    // Add a delay before removing processing attribute to prevent race conditions
+    setTimeout(() => {
+      element.removeAttribute(PROCESSING_ATTRIBUTE);
+    }, 50);
   }
+};
 
-  // Don't mark as processed anymore - allow for reprocessing
-  // element.setAttribute('data-film-grade-processed', 'true');
+// Process text elements using CSS filters instead of canvas
+const processTextElement = async (
+  element: HTMLElement,
+  preset: string
+): Promise<void> => {
+  try {
+    // Skip if already processed
+    if (element.dataset.filmGradeOriginalStyles) {
+      return;
+    }
+    
+    // Save original styles for reverting later
+    const originalStyles = {
+      filter: element.style.filter || '',
+      backgroundColor: element.style.backgroundColor || '',
+      color: element.style.color || '',
+      borderColor: element.style.borderColor || '',
+      outline: element.style.outline || ''
+    };
+    
+    // Store original styles as JSON in data attribute
+    element.dataset.filmGradeOriginalStyles = JSON.stringify(originalStyles);
+    
+    // Apply filter based on preset
+    switch (preset) {
+      case 'greyscale':
+        element.style.filter = `grayscale(100%) ${originalStyles.filter}`;
+        break;
+      case 'fuji':
+        // Fuji film look with CSS filters
+        element.style.filter = `saturate(0.9) sepia(0.2) contrast(1.1) ${originalStyles.filter}`;
+        break;
+      case 'kodak':
+        // Kodak film look with CSS filters
+        element.style.filter = `saturate(1.1) sepia(0.15) contrast(1.05) brightness(1.05) ${originalStyles.filter}`;
+        break;
+      default:
+        // Reset to original
+        delete element.dataset.filmGradeOriginalStyles;
+        break;
+    }
+    
+    // Mark as processed
+    element.dataset.filmGradeProcessed = 'css';
+  } catch (err) {
+    debugError('Error processing text element', err);
+    
+    // Revert to original styles if there's an error
+    if (element.dataset.filmGradeOriginalStyles) {
+      try {
+        const originalStyles = JSON.parse(element.dataset.filmGradeOriginalStyles);
+        element.style.filter = originalStyles.filter;
+        element.style.backgroundColor = originalStyles.backgroundColor;
+        element.style.color = originalStyles.color;
+        element.style.borderColor = originalStyles.borderColor;
+        element.style.outline = originalStyles.outline;
+      } catch (e) {
+        // Silent fail if JSON parsing fails
+      }
+      
+      delete element.dataset.filmGradeOriginalStyles;
+      delete element.dataset.filmGradeProcessed;
+    }
+  }
 };
 
 // Store last applied settings to detect actual changes
@@ -1146,20 +1349,46 @@ const checkForNewContent = async (
 
 // Process new elements added to the DOM via MutationObserver
 const observeDOM = (settings: { preset: string, enableGrain: boolean, enableVignette: boolean, isEnabled: boolean }) => {
-  // Create a more efficient mutation handler
-  const throttledHandleMutation = throttleProcessing(() => {
-    if (settings.isEnabled && settings.preset !== 'none') {
-      try {
-        processAllMedia(settings.preset, settings.enableGrain, settings.enableVignette, settings.isEnabled, false);
-      } catch (e) {
-        debugError('Error in mutation handler', e);
-        // Restart processing after error
-        setTimeout(() => {
-          checkForNewContent(settings.preset, settings.enableGrain, settings.enableVignette, settings.isEnabled);
-        }, CONFIG.CONTENT_CHECK_INTERVAL);
+  // Track currently processing elements
+  const processingElements = new Set<HTMLElement>();
+  
+  // Create a more efficient mutation handler with rate limiting
+  let processingInProgress = false;
+  let pendingProcessRequest = false;
+  
+  const handleMutation = async () => {
+    if (processingInProgress) {
+      pendingProcessRequest = true;
+      return;
+    }
+    
+    processingInProgress = true;
+    
+    try {
+      if (settings.isEnabled && settings.preset !== 'none') {
+        await processAllMedia(settings.preset, settings.enableGrain, settings.enableVignette, settings.isEnabled, false);
+      }
+    } catch (e) {
+      debugError('Error in mutation handler', e);
+    } finally {
+      processingInProgress = false;
+      
+      // If another request came in while we were processing, handle it after a short delay
+      if (pendingProcessRequest) {
+        pendingProcessRequest = false;
+        setTimeout(handleMutation, 200);
       }
     }
-  }, 500); // Reduced from 1000ms to 500ms to be more responsive
+  };
+  
+  // Use a proper debounce with a reasonable timeout
+  let debounceTimeout: NodeJS.Timeout | null = null;
+  const debouncedHandleMutation = () => {
+    if (debounceTimeout) {
+      clearTimeout(debounceTimeout);
+    }
+    debounceTimeout = setTimeout(handleMutation, 300);
+  };
   
   // Create a backup check on interval to catch any elements that might have been missed
   const startBackupChecker = () => {
@@ -1170,7 +1399,7 @@ const observeDOM = (settings: { preset: string, enableGrain: boolean, enableVign
           const { regular, large } = findMediaElements();
           if (regular.length > 0 || large.length > 0) {
             // New elements detected by backup checker
-            throttledHandleMutation();
+            debouncedHandleMutation();
           }
         } else {
           // Clear interval if settings changed
@@ -1192,13 +1421,25 @@ const observeDOM = (settings: { preset: string, enableGrain: boolean, enableVign
   let backupInterval = startBackupChecker();
   
   const observer = new MutationObserver((mutations) => {
+    // Only process if we have the right settings
+    if (!settings.isEnabled || settings.preset === 'none') {
+      return;
+    }
+    
     let mediaAdded = false;
     
     try {
       for (const mutation of mutations) {
+        // For childList mutations (new elements added)
         if (mutation.type === 'childList') {
           for (const node of Array.from(mutation.addedNodes)) {
             if (node instanceof HTMLElement) {
+              // Skip elements that are already being processed
+              if (node.getAttribute(PROCESSING_ATTRIBUTE) === 'true' ||
+                  processingElements.has(node)) {
+                continue;
+              }
+              
               // Quick check for media elements
               if (
                 node instanceof HTMLImageElement || 
@@ -1219,33 +1460,43 @@ const observeDOM = (settings: { preset: string, enableGrain: boolean, enableVign
               }
             }
           }
+        } 
+        // For attribute mutations (element src or style changed)
+        else if (mutation.type === 'attributes') {
+          const target = mutation.target as HTMLElement;
           
-          if (mediaAdded) break; // Found media, no need to check more mutations
-        } else if (mutation.type === 'attributes') {
+          // Skip elements already being processed
+          if (target.getAttribute(PROCESSING_ATTRIBUTE) === 'true' ||
+              processingElements.has(target)) {
+            continue;
+          }
+          
           // Check if this is an image with a changed src attribute
-          if (mutation.target instanceof HTMLImageElement && 
+          if (target instanceof HTMLImageElement && 
               mutation.attributeName === 'src' && 
-              !mutation.target.hasAttribute('data-film-grade-processed')) {
+              !target.hasAttribute('data-film-grade-processed')) {
             mediaAdded = true;
             break;
           }
           
           // Check if this is an element with a changed background-image style
-          if (mutation.target instanceof HTMLElement && 
+          if (target instanceof HTMLElement && 
               mutation.attributeName === 'style' && 
-              !mutation.target.hasAttribute('data-film-grade-processed')) {
-            const style = window.getComputedStyle(mutation.target);
+              !target.hasAttribute('data-film-grade-processed')) {
+            const style = window.getComputedStyle(target);
             if (style.backgroundImage && style.backgroundImage !== 'none') {
               mediaAdded = true;
               break;
             }
           }
         }
+        
+        if (mediaAdded) break; // Exit the loop if we've found media
       }
       
-      // Process new media if found, but throttled
+      // Process new media if found, but debounced
       if (mediaAdded) {
-        throttledHandleMutation();
+        debouncedHandleMutation();
         
         // Reset backup interval since we processed something
         if (backupInterval) {
@@ -1564,4 +1815,110 @@ const finishProcessing = (
       }, CONFIG.CONTENT_CHECK_INTERVAL);
     }
   }, 1500);
+};
+
+// Helper function to lock an image's src property to prevent it from being changed by site's JavaScript
+const lockImageSrc = (imgElement: HTMLImageElement): void => {
+  // Skip if already locked
+  if (imgElement.dataset.filmGradeLocked === 'true') {
+    return;
+  }
+  
+  // Mark as locked
+  imgElement.dataset.filmGradeLocked = 'true';
+  
+  try {
+    // Get the original src property descriptor
+    const originalSrcDescriptor = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, 'src');
+    if (!originalSrcDescriptor) {
+      debugError('Failed to get src property descriptor');
+      return;
+    }
+    
+    // Create a new property descriptor that prevents site JS from changing src
+    Object.defineProperty(imgElement, 'src', {
+      set(value: string) {
+        // Allow our extension to set the src when needed
+        if (imgElement.dataset.filmGradeAllowSet === 'true') {
+          // Call the original setter
+          originalSrcDescriptor.set.call(this, value);
+        } else {
+          // Log attempt to change src (only in debug mode)
+          if (CONFIG.DEBUG) {
+            debugLog(`Blocked attempt to change src to: ${value.substring(0, 50)}...`);
+          }
+        }
+      },
+      get() {
+        // Always use the original getter
+        return originalSrcDescriptor.get.call(this);
+      },
+      configurable: true // Allow the property to be redefined if needed
+    });
+    
+    // Also lock the setAttribute method for src to prevent changes through setAttribute
+    const originalSetAttribute = imgElement.setAttribute;
+    imgElement.setAttribute = function(name: string, value: string) {
+      if (name.toLowerCase() === 'src' && imgElement.dataset.filmGradeAllowSet !== 'true') {
+        // Block setAttribute for src unless allowed
+        if (CONFIG.DEBUG) {
+          debugLog(`Blocked setAttribute attempt for src: ${value.substring(0, 50)}...`);
+        }
+        return;
+      }
+      // Call original for all other attributes
+      return originalSetAttribute.call(this, name, value);
+    };
+    
+    debugLog('Successfully locked image src', imgElement);
+  } catch (err) {
+    debugError('Error locking image src', err);
+  }
+};
+
+// Helper function to handle responsive picture elements after processing an image
+const disablePictureSourceElements = (imgElement: HTMLImageElement): void => {
+  try {
+    // Check if this is inside a picture element
+    const pictureParent = imgElement.closest('picture');
+    if (!pictureParent) return;
+    
+    // Find all source elements within the picture element
+    const sourceElements = pictureParent.querySelectorAll('source');
+    if (sourceElements.length === 0) return;
+    
+    debugLog(`Found ${sourceElements.length} source elements in picture, disabling them`);
+    
+    // Store the original srcset values for potential future restoration
+    if (!pictureParent.dataset.filmGradeSourcesDisabled) {
+      // We only want to save the original state once
+      const originalSources: { element: HTMLSourceElement, srcset: string }[] = [];
+      
+      sourceElements.forEach((source: HTMLSourceElement) => {
+        if (source.srcset) {
+          originalSources.push({
+            element: source,
+            srcset: source.srcset
+          });
+        }
+      });
+      
+      // Store original sources in a data attribute on the picture element
+      if (originalSources.length > 0) {
+        // We can't store the actual elements, just the indices
+        pictureParent.dataset.filmGradeSourcesDisabled = 'true';
+        
+        // Now disable all source elements to prevent them from affecting the img
+        sourceElements.forEach((source: HTMLSourceElement) => {
+          // Save original for debugging
+          source.dataset.filmGradeOriginalSrcset = source.srcset;
+          
+          // Empty the srcset to disable the source
+          source.srcset = '';
+        });
+      }
+    }
+  } catch (err) {
+    debugError('Error disabling source elements', err);
+  }
 }; 
