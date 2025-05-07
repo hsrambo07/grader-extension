@@ -615,6 +615,7 @@ const isProblematicSite = (): boolean => {
     'yarnpkg.com',
     'exa.ai',
     'katestanislavska.com',
+    'https://satabdi.framer.website/',
     
     // Add more as needed
   ];
@@ -1340,47 +1341,51 @@ let activeObserver: MutationObserver | null = null;
 
 // Initialize the content script
 const initializeProcessor = async () => {
-  debugLog('Initializing...');
-  
-  // Set up CSS for loading indicators
-  setupLoadingStyles();
-  
+  debugLog('Content script initializing...'); // New log
+  // setupLoadingStyles(); // Styles are now injected even earlier
+
   const settings = await getFilterSettings();
   lastAppliedSettings = { ...settings };
 
   try {
-    // Apply initial filtering only if enabled and a preset is chosen
     if (settings.isEnabled && settings.preset !== 'none') {
       debugLog(`Applying initial filter: ${settings.preset}`);
       await processAllMedia(settings.preset, settings.enableGrain, settings.enableVignette, settings.isEnabled, true);
-      
-      // Start periodic checks for new content
-      setTimeout(() => {
-        checkForNewContent(settings.preset, settings.enableGrain, settings.enableVignette, settings.isEnabled);
-      }, CONFIG.CONTENT_CHECK_INTERVAL);
+      if (CONFIG.ENABLE_CONTINUOUS_PROCESSING) {
+        setTimeout(() => {
+          checkForNewContent(settings.preset, settings.enableGrain, settings.enableVignette, settings.isEnabled);
+        }, CONFIG.CONTENT_CHECK_INTERVAL);
+      }
     } else {
-      // Revert any existing processed images if starting disabled
-      const allElements = findAllMediaElements();
-      
+      const allElements = findAllMediaElements(); // Ensure it's called after DOM is ready
       for (const element of allElements) {
         revertElement(element);
       }
     }
   } catch (e) {
-    debugError('Error during initialization', e);
+    debugError('Error during initial processing', e); // Changed log message
   }
   
-  // Stop any existing observers
   if (activeObserver) {
     activeObserver.disconnect();
     activeObserver = null;
   }
-  
-  // Start new observer
   activeObserver = observeDOM(settings);
-  
-  debugLog('Initialization complete');
+  debugLog('Content script initialized and observer started.'); // New log
 };
+
+// --- Script Entry Point --- 
+// Inject critical styles immediately
+setupLoadingStyles(); 
+
+if (document.readyState === 'loading') {
+  debugLog('Content script loaded early, waiting for DOMContentLoaded.'); // New log
+  document.addEventListener('DOMContentLoaded', initializeProcessor);
+} else {
+  // DOM is already loaded or past loading (e.g., interactive or complete)
+  debugLog('Content script loaded after DOMContentLoaded, initializing directly.'); // New log
+  initializeProcessor();
+}
 
 // Helper function to get settings
 const getFilterSettings = async (): Promise<{ preset: string, enableGrain: boolean, enableVignette: boolean, isEnabled: boolean }> => {
@@ -1404,13 +1409,6 @@ interface Window {
     findAllMediaElements?: () => HTMLElement[];
     lastResult?: MediaElements;
   };
-}
-
-// Initialize when DOM is ready
-if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', initializeProcessor);
-} else {
-    initializeProcessor();
 }
 
 // Process refreshes in a way that works with the bundled code
