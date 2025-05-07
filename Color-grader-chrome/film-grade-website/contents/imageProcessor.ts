@@ -1,5 +1,19 @@
 // Add a debug mode flag at the top of the file
-const DEBUG_MODE = false; // Set to true only during development
+const DEBUG_MODE = true; // Set to true to help troubleshoot the current issues
+
+// Create a global namespace object to ensure functions survive minification
+(function setupGlobalFunctions() {
+  try {
+    // Create the namespace if it doesn't exist
+    if (typeof window.FilmGradeExt === 'undefined') {
+      window.FilmGradeExt = {
+        callCount: 0
+      };
+    }
+  } catch (e) {
+    console.error("Film Grade: Failed to setup global functions", e);
+  }
+})();
 
 // Helper to conditionally log messages only in debug mode
 const debugLog = (message: string, ...args: any[]) => {
@@ -81,37 +95,93 @@ const isSVGorVector = (element: HTMLElement): boolean => {
 const loadImageCrossOrigin = (src: string): Promise<HTMLImageElement> => {
   return new Promise((resolve, reject) => {
     if (!src) {
-      // If src is empty or null, reject immediately.
-      if (DEBUG_MODE) {
-        console.warn('Film Grade: loadImageCrossOrigin called with empty src.');
-      }
       reject(new Error('Image source is empty.'));
       return;
     }
+    
+    // Function to try loading via the extension's background script as proxy
+    const tryLoadViaProxy = () => {
+      // Use the extension's messaging to request image data from background
+      chrome.runtime.sendMessage(
+        { action: 'proxyImage', imageUrl: src },
+        (response) => {
+          if (chrome.runtime.lastError) {
+            debugError('Error requesting image proxy', chrome.runtime.lastError);
+            reject(new Error(`Failed to proxy image: ${chrome.runtime.lastError.message}`));
+            return;
+          }
+          
+          if (response && response.success && response.dataUrl) {
+            // Create a new image from the data URL
+            const img = new Image();
+            img.onload = () => resolve(img);
+            img.onerror = () => reject(new Error('Failed to load proxied image data URL'));
+            img.src = response.dataUrl;
+          } else {
+            reject(new Error('Failed to get proxied image data'));
+          }
+        }
+      );
+    };
+    
+    // First try the regular way with crossOrigin
     const img = new Image();
     img.crossOrigin = 'anonymous';
-    img.onload = () => resolve(img);
-    img.onerror = (err) => {
-      // Only log error details in debug mode
-      if (DEBUG_MODE) {
-        let errorDetails = 'Unknown error';
-        if (typeof err === 'string') {
-          errorDetails = err;
-        } else if (err instanceof Event) {
-          errorDetails = `Event type: ${err.type}`;
-        }
-        console.error(`Film Grade: Failed to load image cross-origin: ${src}. Error: ${errorDetails}`);
+    
+    // Set a timeout to detect if CORS is taking too long (likely blocked)
+    const corsTimeout = setTimeout(() => {
+      debugLog('CORS timeout, trying fallback methods');
+      // If this is a remote image (not extension or data URL), try proxy
+      if (src.startsWith('http') && !src.startsWith(chrome.runtime.getURL(''))) {
+        tryLoadViaProxy();
+      } else {
+        // For local resources, try without crossOrigin
+        const nonCorsImg = new Image();
+        nonCorsImg.onload = () => {
+          debugLog('Loaded image without CORS');
+          resolve(nonCorsImg);
+        };
+        nonCorsImg.onerror = (err) => {
+          debugError('All image loading methods failed', err);
+          reject(new Error(`Failed to load image: ${src}`));
+        };
+        nonCorsImg.src = src;
       }
-      reject(new Error(`Failed to load image ${src} for canvas processing`));
+    }, 3000); // 3 second timeout for CORS
+    
+    img.onload = () => {
+      clearTimeout(corsTimeout);
+      resolve(img);
     };
+    
+    img.onerror = (err) => {
+      clearTimeout(corsTimeout);
+      debugLog('CORS error, trying fallback methods immediately');
+      
+      // If this is a remote image (not extension or data URL), try proxy
+      if (src.startsWith('http') && !src.startsWith(chrome.runtime.getURL(''))) {
+        tryLoadViaProxy();
+      } else {
+        // For local resources, try without crossOrigin
+        const nonCorsImg = new Image();
+        nonCorsImg.onload = () => {
+          debugLog('Loaded image without CORS');
+          resolve(nonCorsImg);
+        };
+        nonCorsImg.onerror = (err) => {
+          debugError('All image loading methods failed', err);
+          reject(new Error(`Failed to load image: ${src}`));
+        };
+        nonCorsImg.src = src;
+      }
+    };
+    
     try {
       img.src = src;
     } catch (e) {
-      // Catch potential errors if src is invalid (e.g., malformed URL)
-      if (DEBUG_MODE) {
-        console.error(`Film Grade: Error setting img.src for ${src}`);
-      }
-      reject(new Error(`Error setting img.src for ${src}`));
+      clearTimeout(corsTimeout);
+      debugError('Error setting img.src', e);
+      reject(new Error(`Error setting img.src: ${e.message}`));
     }
   });
 };
@@ -119,19 +189,25 @@ const loadImageCrossOrigin = (src: string): Promise<HTMLImageElement> => {
 // Add optimization flags to control how aggressive the extension is
 const CONFIG = {
   // Maximum number of images to process in one page
-  MAX_IMAGES_TO_PROCESS: 100, // Increased from 30 to 100
+  MAX_IMAGES_TO_PROCESS: 200,
   // Skip images smaller than this size (width or height in pixels)
-  MIN_IMAGE_SIZE: 40,
+  MIN_IMAGE_SIZE: 20, // Reduced to catch smaller images
   // Process images larger than this size last (width or height in pixels)
   LARGE_IMAGE_SIZE: 150,
   // Maximum canvas size to prevent memory issues
-  MAX_CANVAS_DIMENSION: 2000,
+  MAX_CANVAS_DIMENSION: 4000, // Increased for larger images
   // Batch size for processing
-  BATCH_SIZE: 5,
+  BATCH_SIZE: 10, // Increased for faster processing
   // Batch delay between batches (ms)
-  BATCH_DELAY: 100,
+  BATCH_DELAY: 50, // Reduced for faster processing
   // How frequently to check for new content (ms)
-  CONTENT_CHECK_INTERVAL: 3000
+  CONTENT_CHECK_INTERVAL: 2000,
+  // Viewport expansion for detection (px beyond viewport)
+  VIEWPORT_EXPANSION: 5000, // Look further beyond viewport
+  // Continuous processing enabled
+  ENABLE_CONTINUOUS_PROCESSING: true,
+  // Debug display for unprocessed images
+  DEBUG_UNPROCESSED: true
 };
 
 // Add a more visible progress indicator in the corner of the page
@@ -180,130 +256,234 @@ interface MediaElements {
 }
 
 // Find all media assets to process (images, videos, canvas)
-// This is the function causing the issue - we need to make it more robust
+// This is a minification-resistant version that will work even after bundling
 function findMediaElements(): MediaElements {
-  // More efficient selectors to find media elements
-  const regularElements: HTMLElement[] = [];
-  const largeElements: HTMLElement[] = [];
-  
-  // Find visible images that are large enough to be worth processing
-  const imageSelector = 'img:not([aria-hidden="true"]):not([role="presentation"]):not([data-film-grade-skip]):not([data-film-grade-processed])';
-  const images = document.querySelectorAll(imageSelector);
-  
-  let imageCount = 0;
-  images.forEach((img) => {
-    const imgEl = img as HTMLImageElement;
-    
-    // Skip if already at our limit
-    if (imageCount >= CONFIG.MAX_IMAGES_TO_PROCESS) return;
-    
-    // Skip if too small (below MIN_IMAGE_SIZE) or SVG
-    if (isSVGorVector(imgEl)) return;
-    
-    // Check if image is visible and large enough to be worth processing
-    const rect = imgEl.getBoundingClientRect();
-    if (rect.width < CONFIG.MIN_IMAGE_SIZE || rect.height < CONFIG.MIN_IMAGE_SIZE) {
-      return;
+  try {
+    // Increment call counter for debugging
+    if (window.FilmGradeExt) {
+      window.FilmGradeExt.callCount = (window.FilmGradeExt.callCount || 0) + 1;
     }
     
-    // Check if image is in viewport or close to it
-    const windowHeight = window.innerHeight || document.documentElement.clientHeight;
-    const windowWidth = window.innerWidth || document.documentElement.clientWidth;
+    // Debug logging
+    debugLog(`findMediaElements called (${window.FilmGradeExt?.callCount || 0})`);
     
-    // Is it in or near the viewport?
-    const vertInView = (rect.top <= windowHeight + 1000 && rect.bottom >= -1000);
-    const horInView = (rect.left <= windowWidth + 1000 && rect.right >= -1000);
+    // More efficient selectors to find media elements
+    const regularElements: HTMLElement[] = [];
+    const largeElements: HTMLElement[] = [];
     
-    if (vertInView && horInView) {
-      // Check if this is a large image to process later
-      if (rect.width > CONFIG.LARGE_IMAGE_SIZE || rect.height > CONFIG.LARGE_IMAGE_SIZE) {
-        largeElements.push(imgEl);
-      } else {
-        regularElements.push(imgEl);
-      }
-      imageCount++;
-    }
-  });
-  
-  // Be more selective with background images too
-  if (imageCount < CONFIG.MAX_IMAGES_TO_PROCESS) {
-    const bgContainers = document.querySelectorAll('div[style*="background-image"]:not([data-film-grade-skip]):not([data-film-grade-processed])');
+    // Find visible images that are large enough to be worth processing
+    // CRITICAL FIX: Only filter on data-film-grade-skip attribute, NOT data-film-grade-processed
+    // This allows us to reprocess images that may have been marked but not actually processed
+    const imageSelector = 'img:not([aria-hidden="true"]):not([role="presentation"]):not([data-film-grade-skip])';
+    const images = document.querySelectorAll(imageSelector);
     
-    bgContainers.forEach((el) => {
+    let imageCount = 0;
+    const skippedImages = [];
+    
+    images.forEach((img) => {
+      const imgEl = img as HTMLImageElement;
+      
       // Skip if already at our limit
-      if (imageCount >= CONFIG.MAX_IMAGES_TO_PROCESS) return;
+      if (imageCount >= CONFIG.MAX_IMAGES_TO_PROCESS) {
+        if (CONFIG.DEBUG_UNPROCESSED) {
+          skippedImages.push({element: imgEl, reason: 'MAX_LIMIT'});
+        }
+        return;
+      }
       
-      const element = el as HTMLElement;
-      const style = window.getComputedStyle(element);
+      // Skip if too small (below MIN_IMAGE_SIZE) or SVG
+      if (isSVGorVector(imgEl)) {
+        if (CONFIG.DEBUG_UNPROCESSED) {
+          skippedImages.push({element: imgEl, reason: 'SVG'});
+        }
+        return;
+      }
       
-      if (style.backgroundImage && 
-          style.backgroundImage !== 'none' && 
-          !style.backgroundImage.includes('svg') && 
-          element.offsetWidth > CONFIG.MIN_IMAGE_SIZE && 
-          element.offsetHeight > CONFIG.MIN_IMAGE_SIZE) {
-        
-        // Check if in viewport like we did with images
-        const rect = element.getBoundingClientRect();
-        const windowHeight = window.innerHeight || document.documentElement.clientHeight;
-        const windowWidth = window.innerWidth || document.documentElement.clientWidth;
-        
-        const vertInView = (rect.top <= windowHeight + 1000 && rect.bottom >= -1000);
-        const horInView = (rect.left <= windowWidth + 1000 && rect.right >= -1000);
-        
-        if (vertInView && horInView) {
-          // Check if this is a large element to process later
-          if (rect.width > CONFIG.LARGE_IMAGE_SIZE || rect.height > CONFIG.LARGE_IMAGE_SIZE) {
-            largeElements.push(element);
-          } else {
-            regularElements.push(element);
+      // Check if image is visible and large enough to be worth processing
+      const rect = imgEl.getBoundingClientRect();
+      if (rect.width < CONFIG.MIN_IMAGE_SIZE || rect.height < CONFIG.MIN_IMAGE_SIZE) {
+        if (CONFIG.DEBUG_UNPROCESSED) {
+          skippedImages.push({element: imgEl, reason: 'TOO_SMALL', size: `${rect.width}x${rect.height}`});
+        }
+        return;
+      }
+      
+      // Check if image is in viewport or close to it
+      const windowHeight = window.innerHeight || document.documentElement.clientHeight;
+      const windowWidth = window.innerWidth || document.documentElement.clientWidth;
+      
+      // Is it in or near the viewport? (using the expanded viewport range)
+      const vertInView = (rect.top <= windowHeight + CONFIG.VIEWPORT_EXPANSION && rect.bottom >= -CONFIG.VIEWPORT_EXPANSION);
+      const horInView = (rect.left <= windowWidth + CONFIG.VIEWPORT_EXPANSION && rect.right >= -CONFIG.VIEWPORT_EXPANSION);
+      
+      if (vertInView && horInView) {
+        // Skip if this image has a data URL source (indicates already processed)
+        if (imgEl.src && imgEl.src.startsWith('data:image') && imgEl.dataset.filmGradeOriginalSrc) {
+          if (CONFIG.DEBUG_UNPROCESSED) {
+            skippedImages.push({element: imgEl, reason: 'ALREADY_PROCESSED'});
           }
-          imageCount++;
+          return;
+        }
+        
+        // Check if this is a large image to process later
+        if (rect.width > CONFIG.LARGE_IMAGE_SIZE || rect.height > CONFIG.LARGE_IMAGE_SIZE) {
+          largeElements.push(imgEl);
+        } else {
+          regularElements.push(imgEl);
+        }
+        imageCount++;
+      } else {
+        if (CONFIG.DEBUG_UNPROCESSED) {
+          skippedImages.push({
+            element: imgEl, 
+            reason: 'OUT_OF_VIEWPORT', 
+            position: `top:${rect.top}, left:${rect.left}`,
+            viewport: `${windowWidth}x${windowHeight}`
+          });
         }
       }
     });
+    
+    // Be more selective with background images too
+    if (imageCount < CONFIG.MAX_IMAGES_TO_PROCESS) {
+      const bgContainers = document.querySelectorAll('div[style*="background-image"]:not([data-film-grade-skip])');
+      
+      bgContainers.forEach((el) => {
+        // Skip if already at our limit
+        if (imageCount >= CONFIG.MAX_IMAGES_TO_PROCESS) return;
+        
+        const element = el as HTMLElement;
+        const style = window.getComputedStyle(element);
+        
+        // Skip if this background image has a data URL source (indicates already processed)
+        if (style.backgroundImage && 
+            style.backgroundImage.startsWith('url("data:image') && 
+            element.dataset.filmGradeOriginalSrc) {
+          return;
+        }
+        
+        if (style.backgroundImage && 
+            style.backgroundImage !== 'none' && 
+            !style.backgroundImage.includes('svg') && 
+            element.offsetWidth > CONFIG.MIN_IMAGE_SIZE && 
+            element.offsetHeight > CONFIG.MIN_IMAGE_SIZE) {
+          
+          // Check if in viewport like we did with images
+          const rect = element.getBoundingClientRect();
+          const windowHeight = window.innerHeight || document.documentElement.clientHeight;
+          const windowWidth = window.innerWidth || document.documentElement.clientWidth;
+          
+          const vertInView = (rect.top <= windowHeight + CONFIG.VIEWPORT_EXPANSION && rect.bottom >= -CONFIG.VIEWPORT_EXPANSION);
+          const horInView = (rect.left <= windowWidth + CONFIG.VIEWPORT_EXPANSION && rect.right >= -CONFIG.VIEWPORT_EXPANSION);
+          
+          if (vertInView && horInView) {
+            // Check if this is a large element to process later
+            if (rect.width > CONFIG.LARGE_IMAGE_SIZE || rect.height > CONFIG.LARGE_IMAGE_SIZE) {
+              largeElements.push(element);
+            } else {
+              regularElements.push(element);
+            }
+            imageCount++;
+          }
+        }
+      });
+    }
+    
+    // Display debug info about skipped images if enabled
+    if (CONFIG.DEBUG_UNPROCESSED && skippedImages.length > 0) {
+      debugLog(`Skipped ${skippedImages.length} images:`);
+      console.table(skippedImages.map(item => ({
+        reason: item.reason,
+        src: item.element instanceof HTMLImageElement ? item.element.src.substring(0, 50) : 'background',
+        size: item.size || `${item.element.clientWidth}x${item.element.clientHeight}`,
+        position: item.position || ''
+      })));
+    }
+    
+    // Store result for debugging
+    const result = { regular: regularElements, large: largeElements };
+    debugLog(`findMediaElements found: ${regularElements.length} regular, ${largeElements.length} large`);
+    
+    // Save to our global namespace to help with minification issues
+    if (window.FilmGradeExt) {
+      window.FilmGradeExt.lastResult = result;
+    }
+    
+    return result;
+  } catch (e) {
+    debugError("Error in findMediaElements", e);
+    // Return empty arrays on error to prevent crashing
+    return { regular: [], large: [] };
   }
-  
-  return { regular: regularElements, large: largeElements };
 }
 
 // Create a backward-compatible version that returns a flat array
 // This will be our fallback for minified code
 function findAllMediaElements(): HTMLElement[] {
   try {
+    debugLog("findAllMediaElements called");
+    
+    // Try to use our globally stored value if available
+    if (window.FilmGradeExt && window.FilmGradeExt.lastResult) {
+      const result = window.FilmGradeExt.lastResult;
+      debugLog("Using cached media elements result");
+      return [...result.regular, ...result.large];
+    }
+    
+    // Otherwise call the main function
     // Try to use the structured function first
     const result = findMediaElements();
     // Check if we got a valid result with arrays
     if (result && Array.isArray(result.regular) && Array.isArray(result.large)) {
       return [...result.regular, ...result.large];
     }
+    
+    throw new Error("findMediaElements returned invalid result");
   } catch (e) {
-    debugError('Error in findMediaElements', e);
-  }
-  
-  // Fallback implementation if the main function fails or returns unexpected format
-  const elements: HTMLElement[] = [];
-  
-  // Find images
-  const images = document.querySelectorAll('img:not([data-film-grade-processed])');
-  images.forEach(img => {
-    const imgEl = img as HTMLImageElement;
-    if (imgEl.width >= CONFIG.MIN_IMAGE_SIZE && imgEl.height >= CONFIG.MIN_IMAGE_SIZE) {
-      elements.push(imgEl);
+    debugError('Error in findAllMediaElements, using fallback', e);
+    
+    // Fallback implementation if the main function fails or returns unexpected format
+    const elements: HTMLElement[] = [];
+    
+    try {
+      // Find images directly
+      const images = document.querySelectorAll('img:not([data-film-grade-processed])');
+      images.forEach(img => {
+        const imgEl = img as HTMLImageElement;
+        if (imgEl.width >= CONFIG.MIN_IMAGE_SIZE && imgEl.height >= CONFIG.MIN_IMAGE_SIZE) {
+          elements.push(imgEl);
+        }
+      });
+      
+      // Find background images directly
+      const bgElements = document.querySelectorAll('div[style*="background-image"]:not([data-film-grade-processed])');
+      bgElements.forEach(el => {
+        elements.push(el as HTMLElement);
+      });
+      
+      debugLog(`Fallback found ${elements.length} elements`);
+    } catch (innerError) {
+      debugError("Fallback search also failed", innerError);
     }
-  });
-  
-  // Find background images
-  const bgElements = document.querySelectorAll('div[style*="background-image"]:not([data-film-grade-processed])');
-  bgElements.forEach(el => {
-    elements.push(el as HTMLElement);
-  });
-  
-  return elements;
+    
+    return elements;
+  }
 }
 
 // Make the function globally available to prevent bundler issues
+// Store on both the window object AND our namespace for maximum compatibility
 window.findMediaElements = findMediaElements;
 window.findAllMediaElements = findAllMediaElements;
+
+// Also store in our namespace
+if (window.FilmGradeExt) {
+  window.FilmGradeExt.findMediaElements = findMediaElements;
+  window.FilmGradeExt.findAllMediaElements = findAllMediaElements;
+  
+  // Add direct access global functions that don't get renamed during minification
+  window["__findMediaElements"] = findMediaElements;
+  window["__findAllMediaElements"] = findAllMediaElements;
+}
 
 // Parse CUBE LUT files - Cache results for performance
 const lutCache: Record<string, { size: number, data: number[][] }> = {};
@@ -440,8 +620,7 @@ const processImage = async (
   // Skip if already processed with same settings or in cache
   if (!forceReprocess && 
       ((processedSrc && processedSrc === originalSrcAttr) ||
-       processedUrlCache.has(cacheKey) ||
-       originalImgElement.hasAttribute('data-film-grade-processed'))) {
+       processedUrlCache.has(cacheKey))) {
     return;
   }
 
@@ -534,8 +713,8 @@ const processImage = async (
       originalImgElement.dataset.filmGradeOriginalSrc = originalSrcAttr!;
       // Add to cache to prevent redundant processing
       processedUrlCache.add(cacheKey);
-      // Mark as processed to avoid finding it again
-      originalImgElement.setAttribute('data-film-grade-processed', 'true');
+      // Don't mark as processed anymore - we want to allow reprocessing
+      // originalImgElement.setAttribute('data-film-grade-processed', 'true');
     } else {
       if (originalImgElement.src.startsWith('data:image') && originalImgElement.dataset.filmGradeOriginalSrc) {
          originalImgElement.src = originalImgElement.dataset.filmGradeOriginalSrc;
@@ -675,8 +854,8 @@ const processBackgroundImage = async (
     element.removeAttribute(PROCESSING_ATTRIBUTE);
   }
 
-  // Add data-film-grade-processed at the end
-  element.setAttribute('data-film-grade-processed', 'true');
+  // Don't mark as processed anymore - allow for reprocessing
+  // element.setAttribute('data-film-grade-processed', 'true');
 };
 
 // Store last applied settings to detect actual changes
@@ -768,6 +947,12 @@ const processAllMedia = async (
   let bgCount = 0;
   let otherCount = 0;
   let largeImageCount = 0;
+  let failedCount = 0;
+  
+  // Track memory usage to prevent browser crashes
+  let estimatedMemoryUsage = 0;
+  const memoryPerPixel = 4; // 4 bytes per pixel (RGBA)
+  const maxMemoryUsage = 100 * 1024 * 1024; // 100MB limit
   
   // Process in batches - first regular images, then large ones
   const batchSize = CONFIG.BATCH_SIZE;
@@ -793,6 +978,7 @@ const processAllMedia = async (
   const processRegularBatch = async () => {
     if (regular.length === 0 || currentRegularBatch * batchSize >= regular.length) {
       // Start processing large images once all regular images are done
+      currentLargeBatch = 0; // Reset to ensure we always start from the beginning
       processLargeBatch();
       return;
     }
@@ -804,26 +990,52 @@ const processAllMedia = async (
     const overallProgress = Math.round((currentRegularBatch / totalBatches) * 100);
     updateGlobalIndicator(true, `Processing regular images: ${overallProgress}%`);
     
+    // Reset memory usage estimate for each batch
+    estimatedMemoryUsage = 0;
+    
     for (let i = startIdx; i < endIdx; i++) {
       const element = regular[i];
       
-      if (element instanceof HTMLImageElement) {
-        await processImage(element, preset, enableGrain, enableVignette, forceElementReprocess);
-        imageCount++;
-      } else if (element.style && element.style.backgroundImage && element.style.backgroundImage.includes('url')) {
-        await processBackgroundImage(element, preset, enableGrain, enableVignette, forceElementReprocess);
-        bgCount++;
-      } else {
-        otherCount++;
+      try {
+        if (element instanceof HTMLImageElement) {
+          // Estimate memory needed for this image
+          const imgWidth = element.naturalWidth || element.width;
+          const imgHeight = element.naturalHeight || element.height;
+          const elementMemory = imgWidth * imgHeight * memoryPerPixel;
+          
+          if (estimatedMemoryUsage + elementMemory > maxMemoryUsage) {
+            // If we'd exceed memory limit, pause briefly to let GC catch up
+            await new Promise(resolve => setTimeout(resolve, 100));
+            estimatedMemoryUsage = elementMemory; // Reset with just this image
+          } else {
+            estimatedMemoryUsage += elementMemory;
+          }
+          
+          await processImage(element, preset, enableGrain, enableVignette, forceElementReprocess);
+          imageCount++;
+        } else if (element.style && element.style.backgroundImage && element.style.backgroundImage.includes('url')) {
+          await processBackgroundImage(element, preset, enableGrain, enableVignette, forceElementReprocess);
+          bgCount++;
+        } else {
+          otherCount++;
+        }
+      } catch (err) {
+        failedCount++;
+        debugError(`Failed to process element at index ${i}`, err);
+        // Continue with next element
       }
     }
     
     // Process next batch of regular images
     currentRegularBatch++;
     if (currentRegularBatch * batchSize < regular.length) {
-      setTimeout(processRegularBatch, CONFIG.BATCH_DELAY);
+      // Use requestAnimationFrame to ensure browser has time to render between batches
+      requestAnimationFrame(() => {
+        setTimeout(processRegularBatch, CONFIG.BATCH_DELAY);
+      });
     } else {
       // Start processing large images once all regular images are done
+      currentLargeBatch = 0; // Reset to ensure we always start from the beginning
       processLargeBatch();
     }
   };
@@ -832,7 +1044,7 @@ const processAllMedia = async (
   const processLargeBatch = async () => {
     if (large.length === 0 || currentLargeBatch * batchSize >= large.length) {
       // All processing complete
-      finishProcessing();
+      finishProcessing(preset, enableGrain, enableVignette, isEnabled, imageCount, largeImageCount, failedCount);
       return;
     }
     
@@ -843,53 +1055,61 @@ const processAllMedia = async (
     const overallProgress = Math.round(((totalRegularBatches + currentLargeBatch) / totalBatches) * 100);
     updateGlobalIndicator(true, `Processing large images: ${overallProgress}%`);
     
+    // Reset memory usage estimate for each batch
+    estimatedMemoryUsage = 0;
+    
     for (let i = startIdx; i < endIdx; i++) {
       const element = large[i];
       
-      if (element instanceof HTMLImageElement) {
-        await processImage(element, preset, enableGrain, enableVignette, forceElementReprocess);
-        largeImageCount++;
-      } else if (element.style && element.style.backgroundImage && element.style.backgroundImage.includes('url')) {
-        await processBackgroundImage(element, preset, enableGrain, enableVignette, forceElementReprocess);
-        bgCount++;
-      } else {
-        otherCount++;
+      try {
+        if (element instanceof HTMLImageElement) {
+          // Estimate memory needed for this image
+          const imgWidth = element.naturalWidth || element.width;
+          const imgHeight = element.naturalHeight || element.height;
+          const elementMemory = imgWidth * imgHeight * memoryPerPixel;
+          
+          if (estimatedMemoryUsage + elementMemory > maxMemoryUsage) {
+            // If we'd exceed memory limit, pause briefly to let GC catch up
+            await new Promise(resolve => setTimeout(resolve, 100));
+            estimatedMemoryUsage = elementMemory; // Reset with just this image
+          } else {
+            estimatedMemoryUsage += elementMemory;
+          }
+          
+          await processImage(element, preset, enableGrain, enableVignette, forceElementReprocess);
+          largeImageCount++;
+        } else if (element.style && element.style.backgroundImage && element.style.backgroundImage.includes('url')) {
+          await processBackgroundImage(element, preset, enableGrain, enableVignette, forceElementReprocess);
+          bgCount++;
+        } else {
+          otherCount++;
+        }
+      } catch (err) {
+        failedCount++;
+        debugError(`Failed to process large element at index ${i}`, err);
+        // Continue with next element
       }
     }
     
     // Process next batch of large images
     currentLargeBatch++;
     if (currentLargeBatch * batchSize < large.length) {
-      setTimeout(processLargeBatch, CONFIG.BATCH_DELAY);
+      // Use requestAnimationFrame to ensure browser has time to render between batches
+      requestAnimationFrame(() => {
+        setTimeout(processLargeBatch, CONFIG.BATCH_DELAY);
+      });
     } else {
       // All processing complete
-      finishProcessing();
+      finishProcessing(preset, enableGrain, enableVignette, isEnabled, imageCount, largeImageCount, failedCount);
     }
-  };
-  
-  // Finish processing and clean up
-  const finishProcessing = () => {
-    lastAppliedSettings = { preset, enableGrain, enableVignette, isEnabled };
-    
-    // Show completion message with counts
-    updateGlobalIndicator(true, `Processing complete. Regular: ${imageCount}, Large: ${largeImageCount}`);
-    
-    // Hide the indicator after a delay
-    setTimeout(() => {
-      updateGlobalIndicator(false);
-      
-      // Schedule another check after completion to catch any new images that appeared during processing
-      if (isEnabled && preset !== 'none') {
-        setTimeout(() => {
-          checkForNewContent(preset, enableGrain, enableVignette, isEnabled);
-        }, CONFIG.CONTENT_CHECK_INTERVAL);
-      }
-    }, 1500);
   };
   
   // Start with regular images
   processRegularBatch();
 };
+
+// Create the throttled version of processAllMedia for use with messages
+const throttledProcessAllMedia = throttleProcessing(processAllMedia);
 
 // Add a function to periodically check for new content
 const checkForNewContent = async (
@@ -900,18 +1120,27 @@ const checkForNewContent = async (
 ) => {
   if (!isEnabled || preset === 'none') return;
   
-  // Find any unprocessed media elements
-  const { regular, large } = findMediaElements();
-  
-  // If we find new unprocessed elements, process them
-  if (regular.length > 0 || large.length > 0) {
-    debugLog(`Found new content to process: ${regular.length + large.length} elements`);
-    await processAllMedia(preset, enableGrain, enableVignette, isEnabled, false);
-  } else {
-    // Schedule another check later
+  try {
+    // Find any unprocessed media elements
+    const { regular, large } = findMediaElements();
+    
+    // If we find new unprocessed elements, process them
+    if (regular.length > 0 || large.length > 0) {
+      debugLog(`Found new content to process: ${regular.length + large.length} elements`);
+      await processAllMedia(preset, enableGrain, enableVignette, isEnabled, false);
+    } else {
+      // Schedule another check later
+      setTimeout(() => {
+        // Continue with the same settings
+        checkForNewContent(preset, enableGrain, enableVignette, isEnabled);
+      }, CONFIG.CONTENT_CHECK_INTERVAL);
+    }
+  } catch (error) {
+    debugError('Error in checkForNewContent, will retry', error);
+    // Even if there's an error, continue checking after a delay
     setTimeout(() => {
       checkForNewContent(preset, enableGrain, enableVignette, isEnabled);
-    }, CONFIG.CONTENT_CHECK_INTERVAL);
+    }, CONFIG.CONTENT_CHECK_INTERVAL * 2); // Wait a bit longer after an error
   }
 };
 
@@ -920,45 +1149,112 @@ const observeDOM = (settings: { preset: string, enableGrain: boolean, enableVign
   // Create a more efficient mutation handler
   const throttledHandleMutation = throttleProcessing(() => {
     if (settings.isEnabled && settings.preset !== 'none') {
-      processAllMedia(settings.preset, settings.enableGrain, settings.enableVignette, settings.isEnabled, false);
+      try {
+        processAllMedia(settings.preset, settings.enableGrain, settings.enableVignette, settings.isEnabled, false);
+      } catch (e) {
+        debugError('Error in mutation handler', e);
+        // Restart processing after error
+        setTimeout(() => {
+          checkForNewContent(settings.preset, settings.enableGrain, settings.enableVignette, settings.isEnabled);
+        }, CONFIG.CONTENT_CHECK_INTERVAL);
+      }
     }
   }, 500); // Reduced from 1000ms to 500ms to be more responsive
+  
+  // Create a backup check on interval to catch any elements that might have been missed
+  const startBackupChecker = () => {
+    if (settings.isEnabled && settings.preset !== 'none') {
+      const backupInterval = setInterval(() => {
+        // Only run if enabled and preset selected
+        if (settings.isEnabled && settings.preset !== 'none') {
+          const { regular, large } = findMediaElements();
+          if (regular.length > 0 || large.length > 0) {
+            // New elements detected by backup checker
+            throttledHandleMutation();
+          }
+        } else {
+          // Clear interval if settings changed
+          clearInterval(backupInterval);
+        }
+      }, 5000); // Check every 5 seconds
+      
+      // Clean up interval after a reasonable amount of time
+      setTimeout(() => {
+        clearInterval(backupInterval);
+      }, 2 * 60 * 1000); // Run backup checker for max 2 minutes
+      
+      return backupInterval;
+    }
+    return null;
+  };
+  
+  // Start backup checker
+  let backupInterval = startBackupChecker();
   
   const observer = new MutationObserver((mutations) => {
     let mediaAdded = false;
     
-    for (const mutation of mutations) {
-      if (mutation.type === 'childList') {
-        for (const node of Array.from(mutation.addedNodes)) {
-          if (node instanceof HTMLElement) {
-            // Quick check for media elements
-            if (
-              node instanceof HTMLImageElement || 
-              node instanceof HTMLVideoElement ||
-              (node.style && node.style.backgroundImage && node.style.backgroundImage !== '')
-            ) {
-              mediaAdded = true;
-              break; // Found media, no need to check more nodes
-            }
-            
-            // Check for potential media children, but only check once
-            if (!mediaAdded && node.querySelectorAll) {
-              const childMediaCount = node.querySelectorAll('img, video, [style*="background-image"]').length;
-              if (childMediaCount > 0) {
+    try {
+      for (const mutation of mutations) {
+        if (mutation.type === 'childList') {
+          for (const node of Array.from(mutation.addedNodes)) {
+            if (node instanceof HTMLElement) {
+              // Quick check for media elements
+              if (
+                node instanceof HTMLImageElement || 
+                node instanceof HTMLVideoElement ||
+                (node.style && node.style.backgroundImage && node.style.backgroundImage !== '')
+              ) {
                 mediaAdded = true;
-                break;
+                break; // Found media, no need to check more nodes
+              }
+              
+              // Check for potential media children, but only check once
+              if (!mediaAdded && node.querySelectorAll) {
+                const childMediaCount = node.querySelectorAll('img, video, [style*="background-image"]').length;
+                if (childMediaCount > 0) {
+                  mediaAdded = true;
+                  break;
+                }
               }
             }
           }
+          
+          if (mediaAdded) break; // Found media, no need to check more mutations
+        } else if (mutation.type === 'attributes') {
+          // Check if this is an image with a changed src attribute
+          if (mutation.target instanceof HTMLImageElement && 
+              mutation.attributeName === 'src' && 
+              !mutation.target.hasAttribute('data-film-grade-processed')) {
+            mediaAdded = true;
+            break;
+          }
+          
+          // Check if this is an element with a changed background-image style
+          if (mutation.target instanceof HTMLElement && 
+              mutation.attributeName === 'style' && 
+              !mutation.target.hasAttribute('data-film-grade-processed')) {
+            const style = window.getComputedStyle(mutation.target);
+            if (style.backgroundImage && style.backgroundImage !== 'none') {
+              mediaAdded = true;
+              break;
+            }
+          }
         }
-        
-        if (mediaAdded) break; // Found media, no need to check more mutations
       }
-    }
-    
-    // Process new media if found, but throttled
-    if (mediaAdded) {
-      throttledHandleMutation();
+      
+      // Process new media if found, but throttled
+      if (mediaAdded) {
+        throttledHandleMutation();
+        
+        // Reset backup interval since we processed something
+        if (backupInterval) {
+          clearInterval(backupInterval);
+          backupInterval = startBackupChecker();
+        }
+      }
+    } catch (e) {
+      debugError('Error in MutationObserver handler', e);
     }
   });
   
@@ -1036,6 +1332,12 @@ const getFilterSettings = async (): Promise<{ preset: string, enableGrain: boole
 interface Window {
   findMediaElements: () => MediaElements;
   findAllMediaElements: () => HTMLElement[];
+  FilmGradeExt: {
+    callCount: number;
+    findMediaElements?: () => MediaElements;
+    findAllMediaElements?: () => HTMLElement[];
+    lastResult?: MediaElements;
+  };
 }
 
 // Initialize when DOM is ready
@@ -1049,6 +1351,7 @@ if (document.readyState === 'loading') {
 // This avoids the "findMediaElements is not a function" error
 const refreshHandler = async () => {
   try {
+    debugLog("Refresh handler called");
     const settings = await getFilterSettings();
     
     if (activeObserver) {
@@ -1057,16 +1360,61 @@ const refreshHandler = async () => {
     }
     
     if (settings.isEnabled && settings.preset !== 'none') {
-      // Get all media elements with our safe function
-      const mediaElements = findAllMediaElements();
+      // Get all media elements with our safe function - try multiple approaches
+      let mediaElements: HTMLElement[] = [];
+      
+      try {
+        // Try our namespace first
+        if (window.FilmGradeExt && typeof window.FilmGradeExt.findAllMediaElements === 'function') {
+          mediaElements = window.FilmGradeExt.findAllMediaElements();
+          debugLog("Got media elements from FilmGradeExt namespace");
+        }
+        // Try direct global access
+        else if (typeof window["__findAllMediaElements"] === 'function') {
+          mediaElements = window["__findAllMediaElements"]();
+          debugLog("Got media elements from direct global access");
+        }
+        // Try the regular window approach
+        else if (typeof window.findAllMediaElements === 'function') {
+          mediaElements = window.findAllMediaElements();
+          debugLog("Got media elements from window object");
+        }
+        // Try calling directly
+        else if (typeof findAllMediaElements === 'function') {
+          mediaElements = findAllMediaElements();
+          debugLog("Got media elements by direct function call");
+        }
+        // Last resort: search DOM directly
+        else {
+          debugLog("All function approaches failed, searching DOM directly");
+          const images = document.querySelectorAll('img');
+          images.forEach(img => {
+            if ((img as HTMLImageElement).width > 50 && (img as HTMLImageElement).height > 50) {
+              mediaElements.push(img as HTMLImageElement);
+            }
+          });
+        }
+      } catch (e) {
+        debugError("Error getting media elements, using fallback", e);
+        // Last resort fallback: search directly 
+        const images = document.querySelectorAll('img');
+        images.forEach(img => mediaElements.push(img as HTMLImageElement));
+      }
+      
+      debugLog(`Processing ${mediaElements.length} elements`);
       
       // Process each element individually
       for (let i = 0; i < mediaElements.length; i++) {
         const element = mediaElements[i];
-        if (element instanceof HTMLImageElement) {
-          await processImage(element, settings.preset, settings.enableGrain, settings.enableVignette, true);
-        } else if (element.style && element.style.backgroundImage && element.style.backgroundImage.includes('url')) {
-          await processBackgroundImage(element, settings.preset, settings.enableGrain, settings.enableVignette, true);
+        try {
+          if (element instanceof HTMLImageElement) {
+            await processImage(element, settings.preset, settings.enableGrain, settings.enableVignette, true);
+          } else if (element.style && element.style.backgroundImage && element.style.backgroundImage.includes('url')) {
+            await processBackgroundImage(element, settings.preset, settings.enableGrain, settings.enableVignette, true);
+          }
+        } catch (elementError) {
+          debugError(`Error processing element ${i}`, elementError);
+          // Continue with next element
         }
       }
     }
@@ -1112,4 +1460,108 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     
     return true; // Indicate async response
   }
-}); 
+});
+
+// Add a function to perform a full-page scan for any missed images
+const performFullPageScan = async (
+  preset: string,
+  enableGrain: boolean,
+  enableVignette: boolean,
+  isEnabled: boolean
+): Promise<void> => {
+  if (!isEnabled || preset === 'none') return;
+  
+  debugLog("Performing full page scan for missed images");
+  
+  try {
+    // Temporarily disable viewport restrictions
+    const originalViewportExpansion = CONFIG.VIEWPORT_EXPANSION;
+    CONFIG.VIEWPORT_EXPANSION = 100000; // Effectively infinite
+    
+    // Find all media elements without viewport restrictions
+    const allElements = findAllMediaElements();
+    
+    // Check for unprocessed elements
+    const unprocessedElements = allElements.filter(element => {
+      if (element instanceof HTMLImageElement) {
+        // Skip if already processed with a data URL
+        return !(element.src && element.src.startsWith('data:image') && element.dataset.filmGradeOriginalSrc);
+      } else if (element.style && element.style.backgroundImage) {
+        return !(element.style.backgroundImage.startsWith('url("data:image') && 
+                element.dataset.filmGradeOriginalSrc);
+      }
+      return false;
+    });
+    
+    // Process any unprocessed elements
+    if (unprocessedElements.length > 0) {
+      debugLog(`Full page scan found ${unprocessedElements.length} unprocessed elements`);
+      
+      // Process in small batches to avoid UI freezing
+      const batchSize = CONFIG.BATCH_SIZE;
+      for (let i = 0; i < unprocessedElements.length; i += batchSize) {
+        const batch = unprocessedElements.slice(i, i + batchSize);
+        
+        for (const element of batch) {
+          try {
+            if (element instanceof HTMLImageElement) {
+              await processImage(element, preset, enableGrain, enableVignette, true);
+            } else if (element.style && element.style.backgroundImage && element.style.backgroundImage.includes('url')) {
+              await processBackgroundImage(element, preset, enableGrain, enableVignette, true);
+            }
+          } catch (error) {
+            debugError(`Error processing element in full page scan`, error);
+          }
+        }
+        
+        // Pause briefly between batches to avoid locking up the UI
+        await new Promise(resolve => setTimeout(resolve, CONFIG.BATCH_DELAY));
+      }
+      
+      // Schedule another check in case there are still more to process
+      setTimeout(() => {
+        checkForNewContent(preset, enableGrain, enableVignette, isEnabled);
+      }, CONFIG.CONTENT_CHECK_INTERVAL);
+    } else {
+      debugLog("Full page scan complete, no unprocessed elements found");
+    }
+    
+    // Restore original viewport expansion
+    CONFIG.VIEWPORT_EXPANSION = originalViewportExpansion;
+  } catch (error) {
+    debugError("Error in full page scan", error);
+  }
+};
+
+// Finish processing and clean up
+const finishProcessing = (
+  preset: string,
+  enableGrain: boolean,
+  enableVignette: boolean,
+  isEnabled: boolean,
+  imageCount: number,
+  largeImageCount: number,
+  failedCount: number
+) => {
+  lastAppliedSettings = { preset, enableGrain, enableVignette, isEnabled };
+  
+  // Show completion message with counts
+  updateGlobalIndicator(true, `Complete: ${imageCount + largeImageCount} images processed (${failedCount} failed)`);
+  
+  // Hide the indicator after a delay
+  setTimeout(() => {
+    updateGlobalIndicator(false);
+    
+    // Perform a full page scan to catch any missed images
+    setTimeout(() => {
+      performFullPageScan(preset, enableGrain, enableVignette, isEnabled);
+    }, 1000);
+    
+    // Schedule another check after completion to catch any new images that appeared during processing
+    if (isEnabled && preset !== 'none' && CONFIG.ENABLE_CONTINUOUS_PROCESSING) {
+      setTimeout(() => {
+        checkForNewContent(preset, enableGrain, enableVignette, isEnabled);
+      }, CONFIG.CONTENT_CHECK_INTERVAL);
+    }
+  }, 1500);
+}; 

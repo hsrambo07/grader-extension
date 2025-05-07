@@ -23,7 +23,8 @@ function IndexPopup() {
   const presets = [
     { id: "none", name: "None" },
     { id: "fuji", name: "Fuji Film" },
-    { id: "kodak", name: "Kodak Film" }
+    { id: "kodak", name: "Kodak Film" },
+    { id: "greyscale", name: "Greyscale (Debug)" }
   ]
 
   // Load settings when the popup opens
