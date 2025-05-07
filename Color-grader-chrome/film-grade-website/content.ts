@@ -4,6 +4,9 @@ console.log('Film Grade: Content script loaded directly');
 // Import the main content script functionality
 import './contents/index';
 
+// Also import our early-start image processor to ensure it loads first
+import './contents/imageProcessor.document_start';
+
 // This adds a marker to ensure the content script is loaded
 document.documentElement.dataset.filmGradeLoaded = 'true';
 

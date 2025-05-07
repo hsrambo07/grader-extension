@@ -1,6 +1,9 @@
 // Add a debug mode flag at the top of the file
 const DEBUG_MODE = true; // Set to true to help troubleshoot the current issues
 
+// Flag to track if we've started processing
+let processingStarted = false;
+
 // Create a global namespace object to ensure functions survive minification
 (function setupGlobalFunctions() {
   try {
@@ -608,7 +611,6 @@ const isProblematicSite = (): boolean => {
     'hackernoon.com',
     'dev.to',
     'react.dev',
-    'github.com',
     'gitlab.com',
     'bitbucket.org',
     'npmjs.com',
@@ -1340,10 +1342,14 @@ let activeObserver: MutationObserver | null = null;
 
 // Initialize the content script
 const initializeProcessor = async () => {
-  debugLog('Initializing...');
+  // Don't initialize multiple times
+  if (processingStarted) {
+    debugLog('Already initialized, skipping...');
+    return;
+  }
   
-  // Set up CSS for loading indicators
-  setupLoadingStyles();
+  debugLog('Initializing...');
+  processingStarted = true;
   
   const settings = await getFilterSettings();
   lastAppliedSettings = { ...settings };
@@ -1382,6 +1388,96 @@ const initializeProcessor = async () => {
   debugLog('Initialization complete');
 };
 
+// NEW: Pre-initialization function that can run very early
+const earlyInitializeProcessor = async () => {
+  debugLog('Early initialization starting...');
+  
+  try {
+    // Get settings even before DOM is ready
+    const settings = await getFilterSettings();
+    
+    if (settings.isEnabled && settings.preset !== 'none') {
+      // Create placeholder observer immediately
+      const earlyObserver = new MutationObserver((mutations) => {
+        for (const mutation of mutations) {
+          if (mutation.type === 'childList') {
+            // Look for newly added images
+            for (const node of Array.from(mutation.addedNodes)) {
+              if (node.nodeName === 'IMG') {
+                const img = node as HTMLImageElement;
+                // Process image immediately if it has a src
+                if (img.src && !img.dataset.filmGradeProcessed) {
+                  processImage(img, settings.preset, settings.enableGrain, settings.enableVignette, false);
+                }
+              }
+            }
+          }
+        }
+      });
+      
+      // Start observing as soon as possible
+      if (document.body) {
+        earlyObserver.observe(document.body, {
+          childList: true,
+          subtree: true
+        });
+      } else if (document.documentElement) {
+        earlyObserver.observe(document.documentElement, {
+          childList: true,
+          subtree: true
+        });
+      }
+      
+      // Clean up early observer after full initialization
+      setTimeout(() => {
+        earlyObserver.disconnect();
+        debugLog('Early observer disconnected after initialization');
+      }, 10000);
+      
+      processingResources.registerObserver(earlyObserver);
+    }
+  } catch (e) {
+    debugError('Error during early initialization', e);
+  }
+};
+
+// Run early initialization immediately
+earlyInitializeProcessor();
+
+// Three-phase initialization strategy:
+// 1. Run earlyInitializeProcessor immediately
+// 2. Listen for DOM ready events
+// 3. Fall back to load event if needed
+
+// Listen for interactive state (HTML parsed, but resources still loading)
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', initializeProcessor);
+  debugLog('Content script loaded early, waiting for DOMContentLoaded');
+} else {
+  // DOM already available, initialize immediately
+  initializeProcessor();
+  debugLog('DOM already available, initializing immediately');
+}
+
+// Backup initialization on window load
+window.addEventListener('load', () => {
+  if (!processingStarted) {
+    debugLog('Window loaded but not initialized yet, running initialization now');
+    initializeProcessor();
+  } else {
+    debugLog('Window loaded, already initialized');
+  }
+});
+
+// Monitor for readystatechange to catch interactive state
+document.addEventListener('readystatechange', () => {
+  debugLog(`Document readyState changed to: ${document.readyState}`);
+  if ((document.readyState === 'interactive' || document.readyState === 'complete') && !processingStarted) {
+    debugLog('Document interactive/complete, initializing');
+    initializeProcessor();
+  }
+});
+
 // Helper function to get settings
 const getFilterSettings = async (): Promise<{ preset: string, enableGrain: boolean, enableVignette: boolean, isEnabled: boolean }> => {
   return new Promise((resolve) => {
@@ -1404,13 +1500,6 @@ interface Window {
     findAllMediaElements?: () => HTMLElement[];
     lastResult?: MediaElements;
   };
-}
-
-// Initialize when DOM is ready
-if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', initializeProcessor);
-} else {
-    initializeProcessor();
 }
 
 // Process refreshes in a way that works with the bundled code
